@@ -1,0 +1,12 @@
+
+streamlit
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+networkx
+torch
+xgboost
+joblib
+plotly

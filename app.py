@@ -11,7 +11,7 @@ import os
 from datetime import datetime
 
 # Project folder
-FOLDER = "/content/drive/MyDrive/Financial_Fraud_Project"
+FOLDER = os.path.dirname(os.path.abspath(__file__))
 
 st.set_page_config(
     page_title="Financial Fraud Detection",

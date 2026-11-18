@@ -1,0 +1,359 @@
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import joblib
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import os
+from datetime import datetime
+
+# Project folder
+FOLDER = "/content/drive/MyDrive/Financial_Fraud_Project"
+
+st.set_page_config(
+    page_title="Financial Fraud Detection",
+    page_icon="💳",
+    layout="wide"
+)
+
+# GNN architecture used during training
+class GCN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(5, 32)
+        self.fc2 = nn.Linear(32, 2)
+
+    def forward(self, x, adj):
+        x = adj @ x
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, p=0.25, training=self.training)
+        x = adj @ x
+        return self.fc2(x)
+
+
+# Load saved models and data
+@st.cache_resource
+def load_models():
+
+    rf = joblib.load(FOLDER + "/random_forest.pkl")
+    xgb = joblib.load(FOLDER + "/xgboost_model.pkl")
+    scaler = joblib.load(FOLDER + "/scaler.pkl")
+
+    with open(FOLDER + "/features.json", "r") as f:
+        feature_cols = json.load(f)
+
+    df = pd.read_csv(FOLDER + "/transactions.csv")
+    adjacency = np.load(FOLDER + "/adjacency.npy")
+
+    gnn = GCN()
+
+    try:
+        weights = torch.load(
+            FOLDER + "/gnn_fraud_model.pth",
+            map_location="cpu",
+            weights_only=True
+        )
+    except TypeError:
+        weights = torch.load(
+            FOLDER + "/gnn_fraud_model.pth",
+            map_location="cpu"
+        )
+
+    gnn.load_state_dict(weights)
+    gnn.eval()
+
+    return rf, xgb, gnn, scaler, feature_cols, df, adjacency
+
+
+rf, xgb, gnn, scaler, feature_cols, df, adjacency = load_models()
+
+
+# Dashboard heading
+st.title("💳 Financial Fraud Detection System")
+st.write(
+    "GNN, Random Forest and XGBoost based "
+    "financial transaction fraud prediction."
+)
+
+st.info("This application uses a synthetic financial transaction dataset.")
+
+# Dataset summary
+st.subheader("Project Overview")
+
+c1, c2, c3 = st.columns(3)
+
+c1.metric("Total Transactions", len(df))
+c2.metric("Fraud Transactions", int(df["is_fraud"].sum()))
+c3.metric(
+    "Genuine Transactions",
+    int((df["is_fraud"] == 0).sum())
+)
+
+st.divider()
+
+# Transaction input
+st.subheader("Enter New Transaction Details")
+
+with st.form("transaction_form"):
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        sender = st.number_input(
+            "Sender Account ID",
+            min_value=1,
+            max_value=349,
+            value=103,
+            step=1
+        )
+
+        amount = st.number_input(
+            "Transaction Amount",
+            min_value=0.01,
+            value=500.0,
+            step=10.0
+        )
+
+        account_age_days = st.number_input(
+            "Account Age (Days)",
+            min_value=0,
+            value=500,
+            step=1
+        )
+
+    with col2:
+        receiver = st.number_input(
+            "Receiver Account ID",
+            min_value=351,
+            max_value=699,
+            value=448,
+            step=1
+        )
+
+        hour = st.slider(
+            "Transaction Hour",
+            min_value=0,
+            max_value=23,
+            value=12
+        )
+
+        previous_transactions = st.number_input(
+            "Previous Transactions",
+            min_value=0,
+            value=5,
+            step=1
+        )
+
+    submitted = st.form_submit_button(
+        "Predict Transaction Risk"
+    )
+
+
+# Prediction
+if submitted:
+
+    if sender == receiver:
+        st.error("Sender and receiver IDs must be different.")
+
+    else:
+
+        # Calculate the same features used during training
+        log_amount = np.log1p(amount)
+
+        is_night = int(hour <= 4 or hour >= 23)
+
+        new_features = pd.DataFrame(
+            [[
+                log_amount,
+                hour,
+                account_age_days,
+                previous_transactions,
+                is_night
+            ]],
+            columns=feature_cols
+        )
+
+        # Scale new transaction features
+        scaled_new = scaler.transform(new_features)
+
+        # Random Forest prediction
+        rf_prob = float(
+            rf.predict_proba(scaled_new)[0,
+            list(rf.classes_).index(1)]
+        )
+
+        # XGBoost prediction
+        xgb_prob = float(
+            xgb.predict_proba(scaled_new)[0,
+            list(xgb.classes_).index(1)]
+        )
+
+        # Build graph for the new transaction
+        N = len(df)
+
+        same_sender = (
+            df["sender"].values == sender
+        )
+
+        same_receiver = (
+            df["receiver"].values == receiver
+        )
+
+        neighbors = np.where(
+            same_sender | same_receiver
+        )[0]
+
+        new_adj = np.zeros(
+            (N + 1, N + 1),
+            dtype=np.float32
+        )
+
+        new_adj[:N, :N] = adjacency
+
+        new_adj[N, N] = 1
+
+        for idx in neighbors:
+            new_adj[N, idx] = 1
+            new_adj[idx, N] = 1
+
+        # Prepare all graph node features
+        existing_scaled = scaler.transform(
+            df[feature_cols]
+        )
+
+        all_features = np.vstack(
+            [existing_scaled, scaled_new]
+        )
+
+        x_tensor = torch.tensor(
+            all_features,
+            dtype=torch.float32
+        )
+
+        adj_tensor = torch.tensor(
+            new_adj,
+            dtype=torch.float32
+        )
+
+        # GNN prediction
+        with torch.no_grad():
+
+            output = gnn(
+                x_tensor,
+                adj_tensor
+            )
+
+            probabilities = torch.softmax(
+                output[-1],
+                dim=0
+            )
+
+            gnn_prob = float(probabilities[1].item())
+
+        # Display results
+        st.divider()
+        st.subheader("Transaction Prediction Results")
+
+        results = {
+            "GNN": gnn_prob,
+            "Random Forest": rf_prob,
+            "XGBoost": xgb_prob
+        }
+
+        cols = st.columns(3)
+
+        for col, (name, probability) in zip(
+            cols, results.items()
+        ):
+
+            with col:
+
+                st.metric(
+                    name + " Fraud Probability",
+                    f"{probability * 100:.2f}%"
+                )
+
+                prediction = int(probability >= 0.5)
+
+                if prediction == 1:
+                    st.error("Predicted: Fraud")
+                else:
+                    st.success("Predicted: Genuine")
+
+        # GNN result details
+        st.subheader("GNN Risk Assessment")
+
+        if gnn_prob >= 0.5:
+            st.error("⚠️ High predicted fraud risk")
+        else:
+            st.success("Predicted as genuine transaction")
+
+        # Save prediction history
+        history_file = FOLDER + "/prediction_history.csv"
+
+        new_record = pd.DataFrame([{
+            "timestamp": datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "sender": sender,
+            "receiver": receiver,
+            "amount": amount,
+            "hour": hour,
+            "account_age_days": account_age_days,
+            "previous_transactions": previous_transactions,
+            "GNN_probability": gnn_prob,
+            "RF_probability": rf_prob,
+            "XGB_probability": xgb_prob,
+            "GNN_prediction": int(gnn_prob >= 0.5),
+            "RF_prediction": int(rf_prob >= 0.5),
+            "XGB_prediction": int(xgb_prob >= 0.5)
+        }])
+
+        if os.path.exists(history_file):
+
+            old_history = pd.read_csv(history_file)
+
+            history = pd.concat(
+                [old_history, new_record],
+                ignore_index=True
+            )
+
+        else:
+            history = new_record
+
+        history.to_csv(
+            history_file,
+            index=False
+        )
+
+        st.success("Prediction saved successfully!")
+
+
+# Prediction history
+st.divider()
+st.subheader("Prediction History")
+
+history_file = FOLDER + "/prediction_history.csv"
+
+if os.path.exists(history_file):
+
+    history = pd.read_csv(history_file)
+
+    st.dataframe(
+        history.tail(20),
+        use_container_width=True
+    )
+
+    st.metric("Total Saved Predictions", len(history))
+
+else:
+    st.info("No new transaction predictions available yet.")
+
+
+st.caption(
+    "Financial Fraud Detection Project | "
+    "Graph Convolutional Network, Random Forest and XGBoost"
+)
